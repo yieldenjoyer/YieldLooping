@@ -22,6 +22,31 @@ interface IERC20 {
     function transferFrom(address, address, uint256) external returns (bool);
 }
 
+/// @dev Minimal SafeERC20 — no external imports. Empty return = success (USDT-style),
+///      reverts on explicit false. forceApprove resets to 0 first (USDT + no residual).
+library SafeERC20 {
+    function safeTransfer(address token, address to, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    }
+
+    function safeTransferFrom(address token, address from, address to, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
+    }
+
+    function forceApprove(address token, address spender, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.approve.selector, spender, uint256(0)));
+        if (amount > 0) {
+            _call(token, abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        }
+    }
+
+    function _call(address token, bytes memory data) private {
+        require(token.code.length > 0, "not a contract");
+        (bool ok, bytes memory ret) = token.call(data);
+        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "ERC20 op failed");
+    }
+}
+
 // ==================== MORPHO BLUE (money market for the loop) ====================
 
 struct MarketParams {
@@ -105,6 +130,7 @@ interface IYT {
 // ==================== USER LOOPER ====================
 
 contract AaveUserPTLooper {
+    using SafeERC20 for address;
 
     uint8 private constant ACTION_OPEN = 1;
     uint8 private constant ACTION_CLOSE = 2;
@@ -170,10 +196,10 @@ contract AaveUserPTLooper {
         uint256 minPtBps
     ) external onlyOwner lock {
         require(initialAmount > 0, "no capital");
-        require(minPtBps <= 10_000, "bad bps");
+        require(minPtBps > 0 && minPtBps <= 10_000, "bad bps");
         require(!IYT(yt).isExpired(), "market expired");
         _validate(mp, yt);
-        IERC20(mp.loanToken).transferFrom(msg.sender, address(this), initialAmount);
+        mp.loanToken.safeTransferFrom(msg.sender, address(this), initialAmount);
 
         if (flashAmount == 0) {
             _openInner(mp, yt, 0, 0, minPtBps); // unlevered: mint + supply only
@@ -192,10 +218,20 @@ contract AaveUserPTLooper {
      * @param minOut floor on loanToken returned to you after debt + flash + premium
      */
     function close(MarketParams calldata mp, address yt, uint256 minOut) external onlyOwner lock {
+        require(minOut > 0, "minOut required");
         _validate(mp, yt);
         bytes32 id = keccak256(abi.encode(mp));
         (, uint128 borrowShares, uint128 collateral) = MORPHO.position(id, address(this));
         require(collateral > 0, "no position");
+
+        // Fail fast, before any flash/state change, if par-redemption's precondition
+        // (holding the YT pre-expiry) isn't met. Sold your YT? Use execute() to sell PT.
+        if (!IYT(yt).isExpired()) {
+            require(
+                IERC20(yt).balanceOf(owner) >= collateral,
+                "pre-expiry close needs YT: rebuy YT or use execute() to sell PT"
+            );
+        }
 
         if (borrowShares == 0) {
             _closeInner(mp, yt, 0, 0, minOut); // no debt: withdraw + redeem only
@@ -234,7 +270,7 @@ contract AaveUserPTLooper {
             revert("bad action");
         }
 
-        IERC20(mp.loanToken).approve(AAVE_POOL, amount + premium); // pool pulls amount + premium
+        mp.loanToken.forceApprove(AAVE_POOL, amount + premium); // pool pulls amount + premium
         return true;
     }
 
@@ -250,7 +286,7 @@ contract AaveUserPTLooper {
         address pt = IYT(yt).PT();
         uint256 mintAmount = IERC20(mp.loanToken).balanceOf(address(this)); // own capital + flash
 
-        IERC20(mp.loanToken).approve(PENDLE_ROUTER, mintAmount);
+        mp.loanToken.forceApprove(PENDLE_ROUTER, mintAmount);
         uint256 py = IPendleRouterV4(PENDLE_ROUTER).mintPyFromToken(
             address(this),
             yt,
@@ -260,8 +296,9 @@ contract AaveUserPTLooper {
                 address(0), address(0), SwapData(SwapType.NONE, address(0), "", false)
             )
         );
+        mp.loanToken.forceApprove(PENDLE_ROUTER, 0); // clear residual mint allowance
 
-        IERC20(pt).approve(address(MORPHO), py);
+        pt.forceApprove(address(MORPHO), py);
         MORPHO.supplyCollateral(mp, py, address(this), "");
 
         if (flashAssets > 0) {
@@ -269,7 +306,8 @@ contract AaveUserPTLooper {
             MORPHO.borrow(mp, flashAssets + premium, 0, address(this), address(this));
         }
 
-        IERC20(yt).transfer(owner, py);
+        pt.forceApprove(address(MORPHO), 0); // no residual collateral allowance
+        yt.safeTransfer(owner, py);
 
         emit Opened(keccak256(abi.encode(mp)), mintAmount - flashAssets, flashAssets, premium, py);
     }
@@ -288,30 +326,34 @@ contract AaveUserPTLooper {
 
         // 1. Repay by SHARES — exact full repayment regardless of interest accrual.
         if (borrowShares > 0) {
-            IERC20(mp.loanToken).approve(address(MORPHO), flashAssets);
+            mp.loanToken.forceApprove(address(MORPHO), flashAssets);
             MORPHO.repay(mp, 0, borrowShares, address(this), "");
+            mp.loanToken.forceApprove(address(MORPHO), 0);
         }
 
         // 2. Withdraw all PT (zero debt -> always healthy)
         MORPHO.withdrawCollateral(mp, collateral, address(this), address(this));
 
-        // 3. PT(+YT pre-expiry) -> SY -> loanToken, at par
+        // 3. PT(+YT pre-expiry) -> SY -> loanToken, at par.
+        //    close() already guaranteed the owner holds the YT pre-expiry.
         uint256 pyIn = collateral;
-        IERC20(pt).approve(PENDLE_ROUTER, pyIn);
+        pt.forceApprove(PENDLE_ROUTER, pyIn);
         if (!IYT(yt).isExpired()) {
-            IERC20(yt).transferFrom(owner, address(this), pyIn);
-            IERC20(yt).approve(PENDLE_ROUTER, pyIn);
+            yt.safeTransferFrom(owner, address(this), pyIn);
+            yt.forceApprove(PENDLE_ROUTER, pyIn);
         }
         uint256 syOut = IPendleRouterV4(PENDLE_ROUTER).redeemPyToSy(address(this), yt, pyIn, 0);
+        pt.forceApprove(PENDLE_ROUTER, 0);
+        if (!IYT(yt).isExpired()) yt.forceApprove(PENDLE_ROUTER, 0);
         ISYToken(sy).redeem(address(this), syOut, mp.loanToken, 0, false);
 
-        // 4. Settle flash + premium; remainder to the user
+        // 4. Settle flash + premium; remainder to the user (minOut floor forced > 0)
         uint256 owed = flashAssets + premium;
         uint256 bal = IERC20(mp.loanToken).balanceOf(address(this));
         require(bal >= owed, "redemption shortfall");
         uint256 toUser = bal - owed;
         require(toUser >= minOut, "slippage");
-        if (toUser > 0) IERC20(mp.loanToken).transfer(owner, toUser);
+        if (toUser > 0) mp.loanToken.safeTransfer(owner, toUser);
 
         emit Closed(id, flashAssets, premium, collateral, toUser);
     }
@@ -356,7 +398,7 @@ contract AaveUserPTLooper {
     }
 
     function sweep(address token) external onlyOwner {
-        IERC20(token).transfer(owner, IERC20(token).balanceOf(address(this)));
+        token.safeTransfer(owner, IERC20(token).balanceOf(address(this)));
     }
 
     receive() external payable {}
