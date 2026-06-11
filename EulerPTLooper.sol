@@ -8,19 +8,19 @@ pragma solidity ^0.8.19;
  *
  *         The Euler flavor needs NO external flash loan: the EVC defers account health
  *         checks to the end of a batch, so the looper borrows the full leverage target
- *         from the debt vault FIRST (transiently insolvent), mints PT+YT at par,
- *         deposits the PT, and passes a single health check on the final position.
- *         Zero flash fee; "flash" liquidity is the debt vault's own cash.
+ *         from the debt vault FIRST, mints PT+YT at par, deferred checks allow you to go over max ltv temporarily 
+ *         and it deposits the PT, and passes a single health check on the final position.
+ *         Zero flash fee; "flash" liquidity is the debt vault's own cash. (verify their is liquidity in the vault before running)
  *
  *         ONE ACTIVE MARKET AT A TIME: the EVC allows one controller (debt vault) per
  *         account. Close fully (controller released) before opening a different Euler
- *         market — or deploy another looper (free) for parallel positions.
+ *         market or deploy another looper (free) for parallel positioning.
  *
  *         WRAPPED DEBT ASSET SUPPORT: some Euler markets borrow a 4626 wrapper of the
  *         Pendle mint token (e.g. debt = eUSDe, mint = USDe). Pass that wrapper per call
  *         and the looper hops through deposit/redeem on it. Pass address(0) when the
  *         debt asset IS the mint token. FORK-TEST that the wrapper's deposit AND redeem
- *         are both open — pre-deposit vaults sometimes lock a side.
+ *         are both open — pre-deposit vaults sometimes lock a side so verify before running always.
  */
 
 interface IERC20 {
@@ -28,6 +28,31 @@ interface IERC20 {
     function transfer(address, uint256) external returns (bool);
     function approve(address, uint256) external returns (bool);
     function transferFrom(address, address, uint256) external returns (bool);
+}
+
+/// @dev Minimal SafeERC20 — no external imports. Empty return = success (USDT-style),
+///      reverts on explicit false. forceApprove resets to 0 first (USDT + no residual).
+library SafeERC20 {
+    function safeTransfer(address token, address to, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    }
+
+    function safeTransferFrom(address token, address from, address to, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
+    }
+
+    function forceApprove(address token, address spender, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.approve.selector, spender, uint256(0)));
+        if (amount > 0) {
+            _call(token, abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        }
+    }
+
+    function _call(address token, bytes memory data) private {
+        require(token.code.length > 0, "not a contract");
+        (bool ok, bytes memory ret) = token.call(data);
+        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "ERC20 op failed");
+    }
 }
 
 interface IERC4626 {
@@ -104,6 +129,7 @@ interface IYT {
 // ==================== USER LOOPER ====================
 
 contract EulerUserPTLooper {
+    using SafeERC20 for address;
 
     address public immutable EVC;
     address public immutable PENDLE_ROUTER;
@@ -179,10 +205,10 @@ contract EulerUserPTLooper {
         uint256 minPtBps
     ) external onlyOwner lock {
         require(initialAmount > 0, "no capital");
-        require(minPtBps <= 10_000, "bad bps");
+        require(minPtBps > 0 && minPtBps <= 10_000, "bad bps");
         require(!IYT(yt).isExpired(), "market expired");
         (,, address mintToken) = _validate(collateralVault, debtVault, wrapper, yt);
-        IERC20(mintToken).transferFrom(msg.sender, address(this), initialAmount);
+        mintToken.safeTransferFrom(msg.sender, address(this), initialAmount);
 
         // Idempotent for the active market. A second, DIFFERENT controller makes the
         // batch-end account check revert — the EVC itself enforces one market at a time.
@@ -207,8 +233,19 @@ contract EulerUserPTLooper {
         address yt,
         uint256 minOut
     ) external onlyOwner lock {
+        require(minOut > 0, "minOut required");
         _validate(collateralVault, debtVault, wrapper, yt);
-        require(IEVault(collateralVault).balanceOf(address(this)) > 0, "no position");
+        uint256 ptShares = IEVault(collateralVault).balanceOf(address(this));
+        require(ptShares > 0, "no position");
+
+        // Fail fast if par-redemption's precondition (holding the YT pre-expiry) isn't met.
+        // Sold your YT? Use execute() to sell PT manually. (Shares ~= PT for escrow vaults.)
+        if (!IYT(yt).isExpired()) {
+            require(
+                IERC20(yt).balanceOf(owner) >= ptShares,
+                "pre-expiry close needs YT: rebuy YT or use execute() to sell PT"
+            );
+        }
         _runBatch(abi.encodeCall(this.closeStep, (collateralVault, debtVault, wrapper, yt, minOut)));
     }
 
@@ -251,7 +288,7 @@ contract EulerUserPTLooper {
         // 2. Mint PT+YT from everything, at par via the SY — never priced through an AMM
         uint256 mintAmount = IERC20(mintToken).balanceOf(address(this));
         require(mintAmount > 0, "nothing to deploy");
-        IERC20(mintToken).approve(PENDLE_ROUTER, mintAmount);
+        mintToken.forceApprove(PENDLE_ROUTER, mintAmount);
         uint256 py = IPendleRouterV4(PENDLE_ROUTER).mintPyFromToken(
             address(this),
             yt,
@@ -260,11 +297,11 @@ contract EulerUserPTLooper {
         );
 
         // 3. Deposit all PT as collateral; single health check fires at batch end
-        IERC20(pt).approve(collateralVault, py);
+        pt.forceApprove(collateralVault, py);
         IEVault(collateralVault).deposit(py, address(this));
 
         // 4. Yield/points leg straight to the user's wallet
-        IERC20(yt).transfer(owner, py);
+        yt.safeTransfer(owner, py);
 
         emit Opened(debtVault, mintAmount - borrowAmount, borrowAmount, py);
     }
@@ -291,10 +328,10 @@ contract EulerUserPTLooper {
 
         // 2. PT(+YT pre-expiry) -> SY -> mint token, at par regardless of PT market price
         uint256 pyIn = ptOut;
-        IERC20(pt).approve(PENDLE_ROUTER, pyIn);
+        pt.forceApprove(PENDLE_ROUTER, pyIn);
         if (!IYT(yt).isExpired()) {
-            IERC20(yt).transferFrom(owner, address(this), pyIn);
-            IERC20(yt).approve(PENDLE_ROUTER, pyIn);
+            yt.safeTransferFrom(owner, address(this), pyIn);
+            yt.forceApprove(PENDLE_ROUTER, pyIn);
         }
         uint256 syOut = IPendleRouterV4(PENDLE_ROUTER).redeemPyToSy(address(this), yt, pyIn, 0);
         ISYToken(sy).redeem(address(this), syOut, mintToken, 0, false);
@@ -305,12 +342,12 @@ contract EulerUserPTLooper {
         if (debt > 0) {
             if (wrapper != address(0)) {
                 uint256 mintBal = IERC20(mintToken).balanceOf(address(this));
-                IERC20(mintToken).approve(wrapper, mintBal);
+                mintToken.forceApprove(wrapper, mintBal);
                 IERC4626(wrapper).deposit(mintBal, address(this)); // wrap back to debt asset
             }
             uint256 debtBal = IERC20(debtAsset).balanceOf(address(this));
             require(debtBal >= debt, "shortfall: transfer mint tokens to looper and retry");
-            IERC20(debtAsset).approve(debtVault, debt);
+            debtAsset.forceApprove(debtVault, debt);
             IEVault(debtVault).repay(type(uint256).max, address(this));
             IEVault(debtVault).disableController(); // release the account for the next market
 
@@ -322,10 +359,10 @@ contract EulerUserPTLooper {
             }
         }
 
-        // 4. Everything left goes to the user
+        // 4. Everything left goes to the user (minOut floor forced > 0 in close())
         uint256 toUser = IERC20(mintToken).balanceOf(address(this));
         require(toUser >= minOut, "slippage");
-        if (toUser > 0) IERC20(mintToken).transfer(owner, toUser);
+        if (toUser > 0) mintToken.safeTransfer(owner, toUser);
 
         emit Closed(debtVault, debt, ptOut, toUser);
     }
@@ -354,7 +391,7 @@ contract EulerUserPTLooper {
     }
 
     function sweep(address token) external onlyOwner {
-        IERC20(token).transfer(owner, IERC20(token).balanceOf(address(this)));
+        token.safeTransfer(owner, IERC20(token).balanceOf(address(this)));
     }
 
     receive() external payable {}
