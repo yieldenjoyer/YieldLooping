@@ -2,21 +2,17 @@
 pragma solidity ^0.8.19;
 
 /**
- * @title AavePTLooper — self-custodial atomic leveraged Pendle PT, flash-funded by Aave V3
- * @notice Identical strategy to MorphoPTLooper — the position still lives on the user's
- *         own Morpho Blue account — but flash liquidity comes from Aave V3. Use this when
- *         the flash size exceeds Morpho's idle loanToken liquidity. Costs Aave's flash
- *         premium (5 bps at current protocol settings):
- *           OPEN  — the premium is financed as Morpho debt (debt = flash + premium).
+ * @title AavePTLooper — universal self-custodial leveraged Pendle PT, flash-funded by Aave V3
+ * @notice Identical strategy to MorphoPTLooper — ANY Pendle PT market + ANY matching
+ *         Morpho Blue market, chosen per call; position lives on the user's own looper —
+ *         but flash liquidity comes from Aave V3. Use when the flash size exceeds
+ *         Morpho's idle loan-token liquidity. Costs Aave's flash premium (5 bps at
+ *         current settings):
+ *           OPEN  — premium financed as Morpho debt (debt = flash + premium).
  *           CLOSE — PT redemption must cover flash + premium.
  *
- *         Everything else matches MorphoPTLooper: per-user looper via factory, no shared
- *         authorization, no admin, additive open(), repay-by-shares exact close,
- *         execute() escape hatch.
- *
- * @dev Chain-agnostic: all protocol addresses are constructor parameters.
- *      Aave V3 Pool differs per chain (Ethereum 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2,
- *      Base 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5) — see README.
+ *         Triplet validation, additive open(), repay-by-shares exact close, execute()
+ *         escape hatch: all identical to MorphoPTLooper. See that file and the README.
  */
 
 interface IERC20 {
@@ -96,9 +92,13 @@ interface IPendleRouterV4 {
 interface ISYToken {
     function redeem(address receiver, uint256 shares, address tokenOut, uint256 minTokenOut, bool burnFromInternalBalance)
         external returns (uint256 amountTokenOut);
+    function isValidTokenIn(address token) external view returns (bool);
+    function isValidTokenOut(address token) external view returns (bool);
 }
 
 interface IYT {
+    function PT() external view returns (address);
+    function SY() external view returns (address);
     function isExpired() external view returns (bool);
 }
 
@@ -106,30 +106,18 @@ interface IYT {
 
 contract AaveUserPTLooper {
 
-    // Morpho SharesMathLib constants — keep in sync with deployed Morpho Blue
-    uint256 private constant VIRTUAL_SHARES = 1e6;
-    uint256 private constant VIRTUAL_ASSETS = 1;
-
     uint8 private constant ACTION_OPEN = 1;
     uint8 private constant ACTION_CLOSE = 2;
 
     IMorpho public immutable MORPHO;
     address public immutable AAVE_POOL;
     address public immutable PENDLE_ROUTER;
-
     address public immutable owner; // the user — set once by the factory, forever
-    bytes32 public immutable marketId;
-    address public immutable LOAN;  // marketParams.loanToken (e.g. USDe)
-    address public immutable SY;
-    address public immutable PT;    // marketParams.collateralToken
-    address public immutable YT;
 
-    MarketParams public marketParams; // set once in constructor, no setters
+    uint256 private unlocked = 1;   // 1 = idle, 2 = mid open/close (flash in flight)
 
-    uint256 private unlocked = 1; // 1 = idle, 2 = mid open/close (flash in flight)
-
-    event Opened(uint256 ownCapital, uint256 flashAssets, uint256 premium, uint256 ptSupplied);
-    event Closed(uint256 debtRepaid, uint256 premium, uint256 ptWithdrawn, uint256 loanTokenToUser);
+    event Opened(bytes32 indexed marketId, uint256 ownCapital, uint256 flashAssets, uint256 premium, uint256 ptSupplied);
+    event Closed(bytes32 indexed marketId, uint256 debtRepaid, uint256 premium, uint256 ptWithdrawn, uint256 loanTokenToUser);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "not owner");
@@ -143,53 +131,55 @@ contract AaveUserPTLooper {
         unlocked = 1;
     }
 
-    constructor(
-        address _owner,
-        address _morpho,
-        address _aavePool,
-        address _pendleRouter,
-        MarketParams memory mp,
-        address sy,
-        address yt
-    ) {
+    constructor(address _owner, address _morpho, address _aavePool, address _pendleRouter) {
         require(
             _owner != address(0) && _morpho != address(0) && _aavePool != address(0) && _pendleRouter != address(0),
             "bad address"
         );
-        require(mp.loanToken != address(0) && mp.collateralToken != address(0), "bad market");
-        require(sy != address(0) && yt != address(0), "bad pendle");
         owner = _owner;
         MORPHO = IMorpho(_morpho);
         AAVE_POOL = _aavePool;
         PENDLE_ROUTER = _pendleRouter;
-        marketParams = mp;
-        marketId = keccak256(abi.encode(mp));
-        LOAN = mp.loanToken;
-        PT = mp.collateralToken;
-        SY = sy;
-        YT = yt;
+    }
+
+    // ==================== MARKET VALIDATION ====================
+
+    /// @dev Derives PT/SY from the YT and proves the triplet is consistent.
+    function _validate(MarketParams calldata mp, address yt) internal view returns (address pt, address sy) {
+        pt = IYT(yt).PT();
+        sy = IYT(yt).SY();
+        require(mp.collateralToken == pt, "market PT != yt PT");
+        require(ISYToken(sy).isValidTokenIn(mp.loanToken), "SY cannot mint from loanToken");
+        require(ISYToken(sy).isValidTokenOut(mp.loanToken), "SY cannot redeem to loanToken");
     }
 
     // ==================== OPEN ====================
 
     /**
-     * @param initialAmount your capital in loanToken, pulled from your wallet (approve first)
-     * @param flashAmount   leverage. Bound: <= initialAmount * lltv/(1-lltv) at oracle price,
-     *                      minus margin. NOTE: the Aave premium is added to your Morpho debt.
-     * @param minPtBps      min PT out per loanToken in, bps (e.g. 9950 = 0.5% tolerance)
+     * @param mp            the EXACT MarketParams of the target Morpho market
+     * @param yt            the Pendle YT for the PT used as collateral
+     * @param initialAmount your capital in loanToken (approve first)
+     * @param flashAmount   leverage. The Aave premium is ADDED to your Morpho debt.
+     * @param minPtBps      min PT out per loanToken in, bps (e.g. 9950)
      */
-    function open(uint256 initialAmount, uint256 flashAmount, uint256 minPtBps)
-        external onlyOwner lock
-    {
+    function open(
+        MarketParams calldata mp,
+        address yt,
+        uint256 initialAmount,
+        uint256 flashAmount,
+        uint256 minPtBps
+    ) external onlyOwner lock {
         require(initialAmount > 0, "no capital");
         require(minPtBps <= 10_000, "bad bps");
-        IERC20(LOAN).transferFrom(msg.sender, address(this), initialAmount);
+        require(!IYT(yt).isExpired(), "market expired");
+        _validate(mp, yt);
+        IERC20(mp.loanToken).transferFrom(msg.sender, address(this), initialAmount);
 
         if (flashAmount == 0) {
-            _openInner(0, 0, minPtBps); // unlevered: mint + supply only
+            _openInner(mp, yt, 0, 0, minPtBps); // unlevered: mint + supply only
         } else {
             IAavePool(AAVE_POOL).flashLoanSimple(
-                address(this), LOAN, flashAmount, abi.encode(ACTION_OPEN, minPtBps), 0
+                address(this), mp.loanToken, flashAmount, abi.encode(ACTION_OPEN, mp, yt, minPtBps), 0
             );
         }
     }
@@ -197,20 +187,22 @@ contract AaveUserPTLooper {
     // ==================== CLOSE ====================
 
     /**
-     * @notice Full close. Pre-expiry requires your YT balance >= PT collateral,
-     *         approved to this contract (par redemption, zero slippage).
+     * @notice Full close of this market's position. Pre-expiry requires your YT balance
+     *         >= PT collateral, approved to this contract.
      * @param minOut floor on loanToken returned to you after debt + flash + premium
      */
-    function close(uint256 minOut) external onlyOwner lock {
-        (, uint128 borrowShares, uint128 collateral) = MORPHO.position(marketId, address(this));
+    function close(MarketParams calldata mp, address yt, uint256 minOut) external onlyOwner lock {
+        _validate(mp, yt);
+        bytes32 id = keccak256(abi.encode(mp));
+        (, uint128 borrowShares, uint128 collateral) = MORPHO.position(id, address(this));
         require(collateral > 0, "no position");
 
         if (borrowShares == 0) {
-            _closeInner(0, 0, minOut); // no debt: withdraw + redeem only
+            _closeInner(mp, yt, 0, 0, minOut); // no debt: withdraw + redeem only
         } else {
-            uint256 debt = _debtAssets(borrowShares); // accrues first — exact this block
+            uint256 debt = _debtAssets(mp, id, borrowShares); // accrues first — exact this block
             IAavePool(AAVE_POOL).flashLoanSimple(
-                address(this), LOAN, debt, abi.encode(ACTION_CLOSE, minOut), 0
+                address(this), mp.loanToken, debt, abi.encode(ACTION_CLOSE, mp, yt, minOut), 0
             );
         }
     }
@@ -228,96 +220,107 @@ contract AaveUserPTLooper {
     ) external returns (bool) {
         require(msg.sender == AAVE_POOL, "only Aave pool");
         require(initiator == address(this), "untrusted initiator");
-        require(asset == LOAN, "wrong asset");
         require(unlocked == 2, "not in flight");
 
-        (uint8 action, uint256 param) = abi.decode(params, (uint8, uint256));
+        (uint8 action, MarketParams memory mp, address yt, uint256 param) =
+            abi.decode(params, (uint8, MarketParams, address, uint256));
+        require(asset == mp.loanToken, "wrong asset");
+
         if (action == ACTION_OPEN) {
-            _openInner(amount, premium, param);
+            _openInner(mp, yt, amount, premium, param);
         } else if (action == ACTION_CLOSE) {
-            _closeInner(amount, premium, param);
+            _closeInner(mp, yt, amount, premium, param);
         } else {
             revert("bad action");
         }
 
-        IERC20(LOAN).approve(AAVE_POOL, amount + premium); // pool pulls amount + premium
+        IERC20(mp.loanToken).approve(AAVE_POOL, amount + premium); // pool pulls amount + premium
         return true;
     }
 
     // ==================== INTERNALS ====================
 
-    function _openInner(uint256 flashAssets, uint256 premium, uint256 minPtBps) internal {
-        uint256 mintAmount = IERC20(LOAN).balanceOf(address(this)); // own capital + flash
+    function _openInner(
+        MarketParams memory mp,
+        address yt,
+        uint256 flashAssets,
+        uint256 premium,
+        uint256 minPtBps
+    ) internal {
+        address pt = IYT(yt).PT();
+        uint256 mintAmount = IERC20(mp.loanToken).balanceOf(address(this)); // own capital + flash
 
-        // loanToken -> PT+YT at par (1:1 pair), never priced through an AMM
-        IERC20(LOAN).approve(PENDLE_ROUTER, mintAmount);
+        IERC20(mp.loanToken).approve(PENDLE_ROUTER, mintAmount);
         uint256 py = IPendleRouterV4(PENDLE_ROUTER).mintPyFromToken(
             address(this),
-            YT,
+            yt,
             (mintAmount * minPtBps) / 10_000,
-            TokenInput(LOAN, mintAmount, LOAN, address(0), address(0), SwapData(SwapType.NONE, address(0), "", false))
+            TokenInput(
+                mp.loanToken, mintAmount, mp.loanToken,
+                address(0), address(0), SwapData(SwapType.NONE, address(0), "", false)
+            )
         );
 
-        // Position belongs to THIS contract = this user. msg.sender == onBehalf,
-        // which Morpho permits natively — no authorization exists anywhere.
-        IERC20(PT).approve(address(MORPHO), py);
-        MORPHO.supplyCollateral(marketParams, py, address(this), "");
+        IERC20(pt).approve(address(MORPHO), py);
+        MORPHO.supplyCollateral(mp, py, address(this), "");
 
         if (flashAssets > 0) {
             // Borrow flash + premium: the Aave fee is financed as Morpho debt.
-            // Reverts here if over-leveraged -> whole tx unwinds, nothing at risk but gas.
-            MORPHO.borrow(marketParams, flashAssets + premium, 0, address(this), address(this));
+            MORPHO.borrow(mp, flashAssets + premium, 0, address(this), address(this));
         }
 
-        IERC20(YT).transfer(owner, py); // yield/points leg straight to the user's wallet
+        IERC20(yt).transfer(owner, py);
 
-        emit Opened(mintAmount - flashAssets, flashAssets, premium, py);
+        emit Opened(keccak256(abi.encode(mp)), mintAmount - flashAssets, flashAssets, premium, py);
     }
 
-    function _closeInner(uint256 flashAssets, uint256 premium, uint256 minOut) internal {
-        (, uint128 borrowShares, uint128 collateral) = MORPHO.position(marketId, address(this));
+    function _closeInner(
+        MarketParams memory mp,
+        address yt,
+        uint256 flashAssets,
+        uint256 premium,
+        uint256 minOut
+    ) internal {
+        address pt = IYT(yt).PT();
+        address sy = IYT(yt).SY();
+        bytes32 id = keccak256(abi.encode(mp));
+        (, uint128 borrowShares, uint128 collateral) = MORPHO.position(id, address(this));
 
         // 1. Repay by SHARES — exact full repayment regardless of interest accrual.
         if (borrowShares > 0) {
-            IERC20(LOAN).approve(address(MORPHO), flashAssets);
-            MORPHO.repay(marketParams, 0, borrowShares, address(this), "");
+            IERC20(mp.loanToken).approve(address(MORPHO), flashAssets);
+            MORPHO.repay(mp, 0, borrowShares, address(this), "");
         }
 
         // 2. Withdraw all PT (zero debt -> always healthy)
-        MORPHO.withdrawCollateral(marketParams, collateral, address(this), address(this));
+        MORPHO.withdrawCollateral(mp, collateral, address(this), address(this));
 
-        // 3. PT(+YT pre-expiry) -> SY -> loanToken, at par regardless of PT market price
+        // 3. PT(+YT pre-expiry) -> SY -> loanToken, at par
         uint256 pyIn = collateral;
-        IERC20(PT).approve(PENDLE_ROUTER, pyIn);
-        if (!IYT(YT).isExpired()) {
-            IERC20(YT).transferFrom(owner, address(this), pyIn);
-            IERC20(YT).approve(PENDLE_ROUTER, pyIn);
+        IERC20(pt).approve(PENDLE_ROUTER, pyIn);
+        if (!IYT(yt).isExpired()) {
+            IERC20(yt).transferFrom(owner, address(this), pyIn);
+            IERC20(yt).approve(PENDLE_ROUTER, pyIn);
         }
-        uint256 syOut = IPendleRouterV4(PENDLE_ROUTER).redeemPyToSy(address(this), YT, pyIn, 0);
-        ISYToken(SY).redeem(address(this), syOut, LOAN, 0, false);
+        uint256 syOut = IPendleRouterV4(PENDLE_ROUTER).redeemPyToSy(address(this), yt, pyIn, 0);
+        ISYToken(sy).redeem(address(this), syOut, mp.loanToken, 0, false);
 
-        // 4. Settle flash + premium (pulled after callback returns); remainder to user
+        // 4. Settle flash + premium; remainder to the user
         uint256 owed = flashAssets + premium;
-        uint256 bal = IERC20(LOAN).balanceOf(address(this));
+        uint256 bal = IERC20(mp.loanToken).balanceOf(address(this));
         require(bal >= owed, "redemption shortfall");
         uint256 toUser = bal - owed;
         require(toUser >= minOut, "slippage");
-        if (toUser > 0) IERC20(LOAN).transfer(owner, toUser);
+        if (toUser > 0) IERC20(mp.loanToken).transfer(owner, toUser);
 
-        emit Closed(flashAssets, premium, collateral, toUser);
+        emit Closed(id, flashAssets, premium, collateral, toUser);
     }
 
-    /// @dev Exact debt in assets for a share amount. Accrues interest first, so within
-    ///      this transaction the result matches repay-by-shares to the wei (same formula,
-    ///      same upward rounding as Morpho's SharesMathLib.toAssetsUp).
-    function _debtAssets(uint128 borrowShares) internal returns (uint256) {
-        MORPHO.accrueInterest(marketParams);
-        (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = MORPHO.market(marketId);
-        return _mulDivUp(
-            uint256(borrowShares),
-            uint256(totalBorrowAssets) + VIRTUAL_ASSETS,
-            uint256(totalBorrowShares) + VIRTUAL_SHARES
-        );
+    /// @dev Exact debt for a share amount: accrue first, then Morpho's own toAssetsUp math.
+    function _debtAssets(MarketParams calldata mp, bytes32 id, uint128 borrowShares) internal returns (uint256) {
+        MORPHO.accrueInterest(mp);
+        (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = MORPHO.market(id);
+        return _mulDivUp(uint256(borrowShares), uint256(totalBorrowAssets) + 1, uint256(totalBorrowShares) + 1e6);
     }
 
     function _mulDivUp(uint256 x, uint256 y, uint256 d) internal pure returns (uint256) {
@@ -326,29 +329,24 @@ contract AaveUserPTLooper {
 
     // ==================== VIEWS ====================
 
-    /// @notice Position snapshot. debtAssetsEstimate uses last-accrued totals;
-    ///         the close path computes the exact figure on-chain.
-    function getPosition() external view returns (
+    function getPosition(MarketParams calldata mp) external view returns (
         uint256 ptCollateral,
         uint256 borrowShares,
         uint256 debtAssetsEstimate
     ) {
-        (, uint128 shares, uint128 collateral) = MORPHO.position(marketId, address(this));
-        (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = MORPHO.market(marketId);
+        bytes32 id = keccak256(abi.encode(mp));
+        (, uint128 shares, uint128 collateral) = MORPHO.position(id, address(this));
+        (,, uint128 totalBorrowAssets, uint128 totalBorrowShares,,) = MORPHO.market(id);
         ptCollateral = collateral;
         borrowShares = shares;
         debtAssetsEstimate = totalBorrowShares == 0 ? 0 : _mulDivUp(
-            uint256(shares),
-            uint256(totalBorrowAssets) + VIRTUAL_ASSETS,
-            uint256(totalBorrowShares) + VIRTUAL_SHARES
+            uint256(shares), uint256(totalBorrowAssets) + 1, uint256(totalBorrowShares) + 1e6
         );
     }
 
     // ==================== FULL USER CONTROL ====================
 
-    /// @notice Raw escape hatch: the owner can make this contract call ANYTHING.
-    ///         If open/close ever break, repay/withdraw on Morpho directly yourself.
-    ///         Funds safety depends on Morpho, Pendle and Aave — not on this code.
+    /// @notice Raw escape hatch — see README runbook.
     function execute(address target, uint256 value, bytes calldata data)
         external payable onlyOwner returns (bytes memory)
     {
@@ -364,43 +362,29 @@ contract AaveUserPTLooper {
     receive() external payable {}
 }
 
-// ==================== FACTORY ====================
+// ==================== FACTORY (one per chain) ====================
 
 contract AavePTLooperFactory {
 
     address public immutable MORPHO;
     address public immutable AAVE_POOL;
     address public immutable PENDLE_ROUTER;
-    address public immutable SY;
-    address public immutable YT;
-    MarketParams public marketParams; // set once, no setters, no admin
 
     mapping(address => address[]) public loopersOf;
 
     event LooperDeployed(address indexed user, address looper);
 
-    constructor(
-        address morpho,
-        address aavePool,
-        address pendleRouter,
-        MarketParams memory mp,
-        address sy,
-        address yt
-    ) {
+    constructor(address morpho, address aavePool, address pendleRouter) {
         require(morpho != address(0) && aavePool != address(0) && pendleRouter != address(0), "bad address");
-        require(mp.loanToken != address(0) && mp.collateralToken != address(0), "bad market");
-        require(sy != address(0) && yt != address(0), "bad pendle");
         MORPHO = morpho;
         AAVE_POOL = aavePool;
         PENDLE_ROUTER = pendleRouter;
-        marketParams = mp;
-        SY = sy;
-        YT = yt;
     }
 
-    /// @notice Deploy YOUR personal looper. The factory holds no power over it — ever.
+    /// @notice Deploy YOUR personal looper — works with every present and future
+    ///         Pendle PT x Morpho market on this chain. The factory holds no power over it.
     function createLooper() external returns (address looper) {
-        looper = address(new AaveUserPTLooper(msg.sender, MORPHO, AAVE_POOL, PENDLE_ROUTER, marketParams, SY, YT));
+        looper = address(new AaveUserPTLooper(msg.sender, MORPHO, AAVE_POOL, PENDLE_ROUTER));
         loopersOf[msg.sender].push(looper);
         emit LooperDeployed(msg.sender, looper);
     }
