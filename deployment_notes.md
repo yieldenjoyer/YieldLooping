@@ -86,9 +86,9 @@ Fill in per chain you deploy to (leave blank until verified):
 
 Official sources:
 - Pendle Router V4: https://docs.pendle.finance/Developers/Contracts/Addresses
-- Morpho Blue: https://docs.morpho.org/getting-started/resources/addresses
-- Aave V3 Pool: https://aave.com/docs/resources/addresses
-- Euler EVC/EVK: https://docs.euler.finance/developers/addresses
+- Morpho Blue: [https://docs.morpho.org/getting-started/resources/addresses](https://docs.morpho.org/get-started/resources/addresses)
+- Aave V3 Pool: [https://aave.com/docs/resources/addresses](https://aave.com/docs/resources/addresses)
+- Euler EVC/EVK: [https://docs.euler.finance/developers/addresses](https://docs.euler.finance/developers/contract-addresses)
 
 ---
 
