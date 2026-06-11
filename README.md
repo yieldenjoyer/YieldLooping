@@ -179,3 +179,5 @@ The invariant matrix any deployment must pass on a fork of the target chain:
 ## Status & disclaimer
 
 **Unaudited.** Fork-tested invariants are necessary, not sufficient — treat any deployment as beta until an audit report is linked here. MIT licensed, provided as-is, no warranty. Leveraged positions can be liquidated; fixed-vs-floating carry can go negative; you are responsible for your own positions and your own market parameters. This is software, not advice. Test thoroughly for any edge cases and via foundry or tenderly before actual deployment.
+
+Read the deployment guide + and test the fork yourself before deploying with real money always.
