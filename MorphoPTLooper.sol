@@ -8,22 +8,20 @@ pragma solidity ^0.8.19;
  *         every open()/close() takes the market as a parameter. One looper can hold
  *         positions in many markets simultaneously (Morpho positions are per-market).
  *
- *         The (market, PT, SY) triplet is VALIDATED on-chain from the YT you pass:
- *         PT and SY are read from the YT contract itself, the market's collateralToken
- *         must equal that PT, and the SY must accept/return the market's loanToken.
- *         A mismatched triplet reverts — it cannot silently misroute funds.
+ *         HARDENING (this revision):
+ *         - SafeERC20 for every token op: tolerates no-return tokens (USDT) and
+ *           reverts on false. forceApprove() resets allowance to 0 first, so repeat
+ *           opens on USDT-style markets don't revert and no approval is left dangling.
+ *         - close() enforces minOut > 0 (no zero-slippage-floor exits).
+ *         - close() fails fast if pre-expiry YT is missing, pointing you to execute()
+ *           for a manual PT-sell exit rather than reverting confusingly mid-flash.
  *
  *         OPEN (one tx):  flash loanToken from Morpho (0 fee) -> mint PT+YT at par ->
  *                         supply PT to your own Morpho position -> borrow to repay flash.
- *                         YT goes straight to your wallet. open() is ADDITIVE per market.
- *
- *         CLOSE (one tx): flash exact debt -> repay by shares (exact despite interest
- *                         accrual) -> withdraw all PT -> redeem at par (return YT
- *                         pre-expiry; not needed post-expiry) -> repay flash ->
- *                         remainder to you.
- *
+ *         CLOSE (one tx): flash exact debt -> repay by shares -> withdraw all PT ->
+ *                         redeem at par (return YT pre-expiry) -> repay flash -> rest to you.
  *         ESCAPE HATCH:   execute() lets the owner raw-call anything as their looper.
- *                         Recovery never depends on this code being correct.
+ *                         Recovery (incl. a manual PT-sell exit) never depends on this code.
  */
 
 interface IERC20 {
@@ -31,6 +29,33 @@ interface IERC20 {
     function transfer(address, uint256) external returns (bool);
     function approve(address, uint256) external returns (bool);
     function transferFrom(address, address, uint256) external returns (bool);
+}
+
+/// @dev Minimal SafeERC20 — no external imports. Treats empty return as success
+///      (USDT/BNB-style), reverts on explicit false, bubbles low-level reverts.
+library SafeERC20 {
+    function safeTransfer(address token, address to, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    }
+
+    function safeTransferFrom(address token, address from, address to, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.transferFrom.selector, from, to, amount));
+    }
+
+    /// @dev Reset to 0 then set — USDT reverts on approve(N) when allowance != 0,
+    ///      and this guarantees no residual allowance is left after the op completes.
+    function forceApprove(address token, address spender, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(IERC20.approve.selector, spender, uint256(0)));
+        if (amount > 0) {
+            _call(token, abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        }
+    }
+
+    function _call(address token, bytes memory data) private {
+        require(token.code.length > 0, "not a contract");
+        (bool ok, bytes memory ret) = token.call(data);
+        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "ERC20 op failed");
+    }
 }
 
 // ==================== MORPHO BLUE ====================
@@ -105,6 +130,7 @@ interface IYT {
 // ==================== USER LOOPER ====================
 
 contract MorphoUserPTLooper {
+    using SafeERC20 for address;
 
     uint8 private constant ACTION_OPEN = 1;
     uint8 private constant ACTION_CLOSE = 2;
@@ -151,14 +177,6 @@ contract MorphoUserPTLooper {
 
     // ==================== OPEN ====================
 
-    /**
-     * @param mp            the EXACT MarketParams of the target Morpho market
-     * @param yt            the Pendle YT for the PT used as collateral (PT/SY derived from it)
-     * @param initialAmount your capital in loanToken, pulled from your wallet (approve first)
-     * @param flashAmount   leverage. Bound: <= initialAmount * lltv/(1-lltv) at oracle price,
-     *                      minus margin. Overshooting reverts atomically — only gas lost.
-     * @param minPtBps      min PT out per loanToken in, bps (e.g. 9950 = 0.5% tolerance)
-     */
     function open(
         MarketParams calldata mp,
         address yt,
@@ -167,10 +185,10 @@ contract MorphoUserPTLooper {
         uint256 minPtBps
     ) external onlyOwner lock {
         require(initialAmount > 0, "no capital");
-        require(minPtBps <= 10_000, "bad bps");
+        require(minPtBps > 0 && minPtBps <= 10_000, "bad bps");
         require(!IYT(yt).isExpired(), "market expired");
         _validate(mp, yt);
-        IERC20(mp.loanToken).transferFrom(msg.sender, address(this), initialAmount);
+        mp.loanToken.safeTransferFrom(msg.sender, address(this), initialAmount);
 
         if (flashAmount == 0) {
             _openInner(mp, yt, 0, minPtBps); // unlevered: mint + supply only
@@ -182,15 +200,27 @@ contract MorphoUserPTLooper {
     // ==================== CLOSE ====================
 
     /**
-     * @notice Full close of this market's position. Pre-expiry requires your YT balance
-     *         >= PT collateral, approved to this contract (par redemption, zero slippage).
-     * @param minOut floor on loanToken returned to you after debt + flash settlement
+     * @notice Full par-redemption close. Pre-expiry REQUIRES your YT balance >= PT
+     *         collateral, approved to this contract. If you sold the YT, par close is
+     *         impossible — use execute() to sell PT on Pendle and unwind manually.
+     * @param minOut floor on loanToken returned to you after debt + flash settlement (> 0)
      */
     function close(MarketParams calldata mp, address yt, uint256 minOut) external onlyOwner lock {
+        require(minOut > 0, "minOut required");
         _validate(mp, yt);
         bytes32 id = keccak256(abi.encode(mp));
         (, uint128 borrowShares, uint128 collateral) = MORPHO.position(id, address(this));
         require(collateral > 0, "no position");
+
+        // Fail fast, before any flash/state change, if the par-redemption precondition
+        // (holding the YT pre-expiry) isn't met — clearer than reverting mid-flash.
+        if (!IYT(yt).isExpired()) {
+            address ytAddr = yt;
+            require(
+                IERC20(ytAddr).balanceOf(owner) >= collateral,
+                "pre-expiry close needs YT: rebuy YT or use execute() to sell PT"
+            );
+        }
 
         if (borrowShares == 0) {
             _closeInner(mp, yt, 0, minOut); // no debt: withdraw + redeem only
@@ -219,7 +249,7 @@ contract MorphoUserPTLooper {
             revert("bad action");
         }
 
-        IERC20(mp.loanToken).approve(address(MORPHO), assets); // repayment pulled after return
+        mp.loanToken.forceApprove(address(MORPHO), assets); // repayment pulled after return
     }
 
     // ==================== INTERNALS ====================
@@ -229,7 +259,7 @@ contract MorphoUserPTLooper {
         uint256 mintAmount = IERC20(mp.loanToken).balanceOf(address(this)); // own capital + flash
 
         // loanToken -> PT+YT at par (1:1 pair), never priced through an AMM
-        IERC20(mp.loanToken).approve(PENDLE_ROUTER, mintAmount);
+        mp.loanToken.forceApprove(PENDLE_ROUTER, mintAmount);
         uint256 py = IPendleRouterV4(PENDLE_ROUTER).mintPyFromToken(
             address(this),
             yt,
@@ -239,10 +269,11 @@ contract MorphoUserPTLooper {
                 address(0), address(0), SwapData(SwapType.NONE, address(0), "", false)
             )
         );
+        mp.loanToken.forceApprove(PENDLE_ROUTER, 0); // clear any residual mint allowance
 
         // Position belongs to THIS contract = this user. msg.sender == onBehalf,
         // which Morpho permits natively — no authorization exists anywhere.
-        IERC20(pt).approve(address(MORPHO), py);
+        pt.forceApprove(address(MORPHO), py);
         MORPHO.supplyCollateral(mp, py, address(this), "");
 
         if (flashAssets > 0) {
@@ -251,7 +282,8 @@ contract MorphoUserPTLooper {
             MORPHO.borrow(mp, flashAssets, 0, address(this), address(this));
         }
 
-        IERC20(yt).transfer(owner, py); // yield/points leg straight to the user's wallet
+        pt.forceApprove(address(MORPHO), 0); // no residual collateral allowance
+        yt.safeTransfer(owner, py);           // yield/points leg straight to the user's wallet
 
         emit Opened(keccak256(abi.encode(mp)), mintAmount - flashAssets, flashAssets, py);
     }
@@ -264,29 +296,34 @@ contract MorphoUserPTLooper {
 
         // 1. Repay by SHARES — exact full repayment regardless of interest accrual.
         if (borrowShares > 0) {
-            IERC20(mp.loanToken).approve(address(MORPHO), flashAssets);
+            mp.loanToken.forceApprove(address(MORPHO), flashAssets);
             MORPHO.repay(mp, 0, borrowShares, address(this), "");
+            mp.loanToken.forceApprove(address(MORPHO), 0);
         }
 
         // 2. Withdraw all PT (zero debt -> always healthy)
         MORPHO.withdrawCollateral(mp, collateral, address(this), address(this));
 
-        // 3. PT(+YT pre-expiry) -> SY -> loanToken, at par regardless of PT market price
+        // 3. PT(+YT pre-expiry) -> SY -> loanToken, at par regardless of PT market price.
+        //    close() already guaranteed the owner holds the YT pre-expiry.
         uint256 pyIn = collateral;
-        IERC20(pt).approve(PENDLE_ROUTER, pyIn);
+        pt.forceApprove(PENDLE_ROUTER, pyIn);
         if (!IYT(yt).isExpired()) {
-            IERC20(yt).transferFrom(owner, address(this), pyIn);
-            IERC20(yt).approve(PENDLE_ROUTER, pyIn);
+            yt.safeTransferFrom(owner, address(this), pyIn);
+            yt.forceApprove(PENDLE_ROUTER, pyIn);
         }
         uint256 syOut = IPendleRouterV4(PENDLE_ROUTER).redeemPyToSy(address(this), yt, pyIn, 0);
+        pt.forceApprove(PENDLE_ROUTER, 0);
+        if (!IYT(yt).isExpired()) yt.forceApprove(PENDLE_ROUTER, 0);
         ISYToken(sy).redeem(address(this), syOut, mp.loanToken, 0, false);
 
-        // 4. Settle flash (pulled after callback returns); remainder to the user
+        // 4. Settle flash (pulled after callback returns); remainder to the user.
+        //    The aggregate minOut floor is the real slippage guard — close() forces it > 0.
         uint256 bal = IERC20(mp.loanToken).balanceOf(address(this));
         require(bal >= flashAssets, "redemption shortfall");
         uint256 toUser = bal - flashAssets;
         require(toUser >= minOut, "slippage");
-        if (toUser > 0) IERC20(mp.loanToken).transfer(owner, toUser);
+        if (toUser > 0) mp.loanToken.safeTransfer(owner, toUser);
 
         emit Closed(id, flashAssets, collateral, toUser);
     }
@@ -306,8 +343,6 @@ contract MorphoUserPTLooper {
 
     // ==================== VIEWS ====================
 
-    /// @notice Position snapshot for one market. debtAssetsEstimate uses last-accrued
-    ///         totals; the close path computes the exact figure on-chain.
     function getPosition(MarketParams calldata mp) external view returns (
         uint256 ptCollateral,
         uint256 borrowShares,
@@ -326,8 +361,8 @@ contract MorphoUserPTLooper {
     // ==================== FULL USER CONTROL ====================
 
     /// @notice Raw escape hatch: the owner can make this contract call ANYTHING.
-    ///         If open/close ever break, repay/withdraw on Morpho directly yourself.
-    ///         Funds safety depends on Morpho and Pendle — not on this code.
+    ///         Use this to sell PT on Pendle and unwind manually if you've sold the YT
+    ///         and can't par-close. Funds safety depends on Morpho and Pendle, not this code.
     function execute(address target, uint256 value, bytes calldata data)
         external payable onlyOwner returns (bytes memory)
     {
@@ -337,7 +372,7 @@ contract MorphoUserPTLooper {
     }
 
     function sweep(address token) external onlyOwner {
-        IERC20(token).transfer(owner, IERC20(token).balanceOf(address(this)));
+        token.safeTransfer(owner, IERC20(token).balanceOf(address(this)));
     }
 
     receive() external payable {}
