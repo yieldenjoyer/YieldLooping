@@ -3,7 +3,7 @@ BTC: bc1pqve32dpz9zma2l67ns4z0q7w42usdtdgqhwd5pyqng8kv9cacwyszd4xsp
 ETH:0x523bB94BFe5cf47087eB5556D5ed00515cdC487e - can send any eth token (USDT/USDC/ETH/etc)
 SOL:8UDYmi9Fw7Kg8p8K1xTc2pnViPswVga9vHmTvgwqFBzw
 SUI:0xb9726c6024e577684eaeb4670ea97a387b4de558558c3694a62da6179a5ac121
-# PT Looper — Self-Custodial Leveraged Pendle PT, Any Market
+# PT Looper — Self-Custodial Leveraged Pendle PT, Any Market with Aave/Morpho or Euler
 
 One-transaction leveraged fixed-yield on **any Pendle PT market**: flash/atomic borrow → mint PT+YT at par → PT as collateral on a money market → borrow to settle → done. The YT (yield + points leg) goes straight to your wallet. Close unwinds everything in one transaction, also at par.
 
