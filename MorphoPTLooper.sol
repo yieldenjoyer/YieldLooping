@@ -8,13 +8,14 @@ pragma solidity ^0.8.19;
  *         - SLIPPAGE FIX: open() now takes an ABSOLUTE `minPtOut` (in PT units) instead
  *           of a bps figure computed off the loan-token amount. The old bps floor assumed
  *           1 loanToken == 1 PT, which is false on any SY whose exchange rate != 1 (most
- *           yield-bearing PTs) — it silently became a no-op. The caller (UI) now passes the
+ *           yield-bearing PTs) — it silently became a no op. The caller (UI) now passes the
  *           expected PT out minus tolerance, denominated correctly.
- *         - EOA-ONLY: factory deploy + open()/close() require msg.sender == tx.origin.
+ *         - EOA ONLY: factory deploy + open()/close() require msg.sender == tx.origin.
  *           This intentionally EXCLUDES smart-contract wallets (Safe, 4337, etc.).
  *           Remove the onlyEOA modifier / factory check to support those later.
  *         - close() now also checks YT *allowance* (not just balance) pre-expiry, so a
  *           missing approval fails up front with a clear message instead of mid-flash.
+ *           
  *           Made by 0xpepe
  */
 interface IERC20 {
@@ -282,6 +283,11 @@ contract MorphoUserPTLooper {
     }
     function sweep(address token) external onlyOwner {
         token.safeTransfer(owner, IERC20(token).balanceOf(address(this)));
+    }
+    /// @notice Recover any ETH accidentally sent here (none is used in normal operation).
+    function sweepETH() external onlyOwner {
+        (bool ok, ) = payable(owner).call{value: address(this).balance}("");
+        require(ok, "eth sweep failed");
     }
     receive() external payable {}
 }
