@@ -3,13 +3,15 @@ pragma solidity ^0.8.19;
 /**
  * @title AavePTLooper — universal self-custodial leveraged Pendle PT, flash-funded by Aave V3
  * @notice Same strategy as MorphoPTLooper; flash liquidity from Aave V3 (5 bps premium)
- *         for when Morpho lacks idle loan-token liquidity. EOA-only, one looper per user. Made by 0xpepe
+ *         for when Morpho lacks idle loan-token liquidity. EOA-only, one looper per user. 
  *
  *         v2 CHANGES: absolute `minPtOut` (see MorphoPTLooper for the slippage rationale),
  *         EOA-only deploy + open/close, YT allowance pre-check on close.
  *
  *         NOTE: this file requires `viaIR = true` (it is stack-too-deep on the legacy
  *         pipeline). foundry.toml sets it; if you compile elsewhere, enable viaIR.
+ *         
+ *         Made by 0xpepe 
  */
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -187,8 +189,8 @@ contract AaveUserPTLooper {
             );
         }
     }
-    /// @dev On Aave ANYONE can initiate a flash naming this contract as receiver —
-    ///      the initiator check is load-bearing. Do not remove it.
+    /// @dev On Aave ANYONE can initiate a flash naming this contract as receiver 
+    ///      the initiator check is load bearing. Do not remove it.
     function executeOperation(
         address asset,
         uint256 amount,
@@ -307,6 +309,11 @@ contract AaveUserPTLooper {
     }
     function sweep(address token) external onlyOwner {
         token.safeTransfer(owner, IERC20(token).balanceOf(address(this)));
+    }
+    /// @notice Recover any ETH accidentally sent here (none is used in normal operation).
+    function sweepETH() external onlyOwner {
+        (bool ok, ) = payable(owner).call{value: address(this).balance}("");
+        require(ok, "eth sweep failed");
     }
     receive() external payable {}
 }
