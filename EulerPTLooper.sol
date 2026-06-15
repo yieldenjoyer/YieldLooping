@@ -4,7 +4,7 @@ pragma solidity ^0.8.19;
  * @title EulerPTLooper — universal self-custodial leveraged Pendle PT on Euler v2 (EVK)
  * @notice No external flash: the EVC defers account health checks to the end of a batch,
  *         so the looper borrows the full leverage target first, mints PT, deposits it, and
- *         passes a single health check on the final position. EOA usage only, one looper per user. 
+ *         passes a single health check on the final position. EOA-only, one looper per user.
  *         ONE ACTIVE EULER MARKET AT A TIME (EVC allows one controller per account).
  *
  *         v2 CHANGES:
@@ -17,7 +17,7 @@ pragma solidity ^0.8.19;
  *         WRAPPED DEBT ASSET: pass the 4626 wrapper when debt asset wraps the mint token
  *         (e.g. debt = eUSDe, mint = USDe), else address(0). Fork-test that the wrapper's
  *         deposit AND redeem are both open before using it.
- *          Made by 0xpepe
+ *         made by 0xpepe
  */
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -209,11 +209,14 @@ contract EulerUserPTLooper {
         require(unlocked == 2, "not in flight");
         address pt = IYT(yt).PT();
         address mintToken = wrapper == address(0) ? IEVault(debtVault).asset() : IERC4626(wrapper).asset();
+        // Borrow the full leverage target first — transient insolvency is fine inside the batch.
+        // Track what the borrow produced IN MINT-TOKEN UNITS so the event math can't cross units.
+        uint256 mintFromBorrow;
         if (borrowAmount > 0) {
             uint256 borrowed = IEVault(debtVault).borrow(borrowAmount, address(this));
-            if (wrapper != address(0)) {
-                IERC4626(wrapper).redeem(borrowed, address(this), address(this));
-            }
+            mintFromBorrow = wrapper == address(0)
+                ? borrowed
+                : IERC4626(wrapper).redeem(borrowed, address(this), address(this)); // unwrap to mint token
         }
         uint256 mintAmount = IERC20(mintToken).balanceOf(address(this));
         require(mintAmount > 0, "nothing to deploy");
@@ -224,10 +227,13 @@ contract EulerUserPTLooper {
             minPtOut,
             TokenInput(mintToken, mintAmount, mintToken, address(0), address(0), SwapData(SwapType.NONE, address(0), "", false))
         );
+        mintToken.forceApprove(PENDLE_ROUTER, 0);
         pt.forceApprove(collateralVault, py);
         IEVault(collateralVault).deposit(py, address(this));
+        pt.forceApprove(collateralVault, 0);
         yt.safeTransfer(owner, py);
-        emit Opened(debtVault, mintAmount - borrowAmount, borrowAmount, py);
+        // ownCapital in mint-token units; mintAmount >= mintFromBorrow so this cannot underflow
+        emit Opened(debtVault, mintAmount - mintFromBorrow, borrowAmount, py);
     }
     function closeStep(
         address collateralVault,
@@ -253,6 +259,8 @@ contract EulerUserPTLooper {
             yt.forceApprove(PENDLE_ROUTER, pyIn);
         }
         uint256 syOut = IPendleRouterV4(PENDLE_ROUTER).redeemPyToSy(address(this), yt, pyIn, 0);
+        pt.forceApprove(PENDLE_ROUTER, 0);
+        if (!IYT(yt).isExpired()) yt.forceApprove(PENDLE_ROUTER, 0);
         ISYToken(sy).redeem(address(this), syOut, mintToken, 0, false);
         // 3. Repay FULL debt if any
         uint256 debt = IEVault(debtVault).debtOf(address(this));
@@ -261,11 +269,13 @@ contract EulerUserPTLooper {
                 uint256 mintBal = IERC20(mintToken).balanceOf(address(this));
                 mintToken.forceApprove(wrapper, mintBal);
                 IERC4626(wrapper).deposit(mintBal, address(this));
+                mintToken.forceApprove(wrapper, 0);
             }
             uint256 debtBal = IERC20(debtAsset).balanceOf(address(this));
             require(debtBal >= debt, "shortfall: transfer mint tokens to looper and retry");
             debtAsset.forceApprove(debtVault, debt);
             IEVault(debtVault).repay(type(uint256).max, address(this));
+            debtAsset.forceApprove(debtVault, 0);
         }
         // 4. ALWAYS release the controller (open() always enabled it; debt is 0 now).
         //    This is the fix for unlevered/zero-debt closes stranding the controller.
@@ -301,6 +311,11 @@ contract EulerUserPTLooper {
     }
     function sweep(address token) external onlyOwner {
         token.safeTransfer(owner, IERC20(token).balanceOf(address(this)));
+    }
+    /// @notice Recover any ETH accidentally sent here (none is used in normal operation).
+    function sweepETH() external onlyOwner {
+        (bool ok, ) = payable(owner).call{value: address(this).balance}("");
+        require(ok, "eth sweep failed");
     }
     receive() external payable {}
 }
