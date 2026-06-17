@@ -1,8 +1,8 @@
-## PT Loopers — v2 (free, EOA-only, self-custodial Pendle PT looping)
+## PT Loopers — v3 (free, EOAbonly, self custodial Pendle PT looping)
 
 # Support / Donations
 
-If it saved you money, a tip is appreciated — never required, and it buys you nothing extra.
+If it saved you money, a tip is appreciated but never required, and it buys you nothing extra.
 
 | Chain | Address |
 |---|---|
@@ -21,17 +21,17 @@ Three independent loopers, same strategy (leveraged Pendle PT), different flash/
 | `AavePTLooper.sol` | Aave V3 flash | **~5 bps premium / leg** | fallback for large flashes; **needs viaIR** |
 | `EulerPTLooper.sol` | Euler EVC deferred checks | 0 flash fee | one Euler market at a time; optional 4626 wrapper |
 
-Every user deploys their **own** looper from the factory and is its immutable `owner`. No protocol fee exists anywhere in these contracts — there is no treasury, admin, or skim to remove. "Free" means *no fee taken by you/YAM*; users still pay gas + the borrow interest inherent to leverage (+ Aave's premium on that variant only).
+Every user deploys their **own** looper from the factory and is its immutable `owner`. No protocol fee exists anywhere in these contracts — there is no treasury, admin, or skim to remove. "Free" means *no fee taken from you(the user) by some protocol*, but users still pay gas + the borrow interest inherent to leverage (+ Aave's premium on that variant only if you flash via them).
 
 ---
 
 ## updates:
 
-- **Slippage (M1):** `open()` now takes an **absolute `minPtOut`** (PT units) instead of a bps figure derived from the loan-token amount. The old `(amount * bps)/10_000` assumed 1 loan-token = 1 PT, which is false on any SY whose exchange rate ≠ 1 (most yield-bearing PTs) — it silently became a no-op. Your UI now computes the floor from the Pendle quote.
-- **EOA-only:** `createLooper()` and `open()/close()` require `msg.sender == tx.origin`. **This excludes Safe / 4337 / smart-contract wallets** by design. Remove the `onlyEOA` modifier + the factory check if you ever want to support them.
-- **Euler controller release (M3):** `close()` now releases the controller even on a zero-debt (unlevered) position, so it can't strand and block the next market.
+- **Slippage (M1):** `open()` now takes an **absolute `minPtOut`** (PT units) instead of a bps figure derived from the loan token amount. The old `(amount * bps)/10_000` assumed 1 loan-token = 1 PT, which is false on any SY whose exchange rate ≠ 1 (most yield-bearing PTs) — it silently became a no op. Your UI now computes from the Pendle quote.
+- **EOA-only:** `createLooper()` and `open()/close()` require `msg.sender == tx.origin`. **This excludes Safe / 4337 / smart contract wallets** by design. Remove the `onlyEOA` modifier + the factory check if you ever want to support them.
+- **Euler controller release (M3):** `close()` now releases the controller even on a zero debt (unlevered) position, so it can't strand and block the next market.
 - **Euler YT pre-check (M4):** uses `convertToAssets(shares)` for the exact PT amount, and now also checks YT **allowance**, not just balance.
-- **All loopers:** `close()` checks YT allowance up front (clear error instead of a mid-flash revert).
+- **All loopers:** `close()` checks YT allowance up front (clear error instead of a mid flash revert).
 
 **Build status:** all three compile clean on solc 0.8.19, 0 warnings (Morpho/Euler legacy pipeline; Aave under `via_ir = true`, set in `foundry.toml`). Sizes are well under the 24,576-byte limit.
 
@@ -51,7 +51,8 @@ forge install foundry-rs/forge-std
 forge test --fork-url $ETH_RPC_URL -vvvv
 ```
 
-> The tests are **written but not yet run** — they need a mainnet fork + real market addresses (no PT/markets exist on a fresh testnet). Run them before deploying. Tests use `vm.startPrank(user, user)` so the second arg sets `tx.origin` for the EOA gate; a single-arg prank reverts with "EOA only".
+> These have been tested via foundry, compiles + works as intended, however still recommend to run tests with forge test --profile test (test build needs optimizer_runs=1 for via-IR stack; deploy
+  stays at 200) or you get a stack-too-deep error.
 
 ---
 
